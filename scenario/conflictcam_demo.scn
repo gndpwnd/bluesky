@@ -1,0 +1,39 @@
+# CONFLICTCAM Demo Scenario
+# Two aircraft on converging paths to trigger a conflict
+# Enable CONFLICTCAM to capture screenshots at conflict moments
+
+# Setup
+0:00:00.00>PAN 29.18 -81.06
+0:00:00.00>ZOOM 30
+
+# Enable conflict detection
+0:00:00.00>ASAS ON
+0:00:00.00>RESO OFF
+
+# Enable CONFLICTCAM plugin
+0:00:00.00>PLUGIN CONFLICTCAM
+0:00:00.00>CONFLICTCAM ON
+0:00:00.00>CONFLICTCAM COOLDOWN 3
+
+# Enable CRELOG for AfterSky analysis
+0:00:00.00>CRELOG POSITIONS 1.0 "Position Log"
+0:00:00.00>POSITIONS ADD simtime,traf.id,traf.lat,traf.lon,traf.alt,traf.hdg,traf.trk,traf.tas,traf.gs,traf.vs,traf.cas,traf.M
+0:00:00.00>CRELOG CONFLICTS 1.0 "Conflict Log"
+0:00:00.00>CONFLICTS ADD simtime,traf.id,traf.cd.inconf,traf.cd.tcpamax
+0:00:00.00>POSITIONS ON
+0:00:00.00>CONFLICTS ON
+
+# TRAIL for visual paths
+0:00:00.00>TRAIL ON
+
+# Create two user aircraft on converging headings
+0:00:02.00>CRE UAL101 B738 29.30 -81.20 180 FL100 250
+0:00:04.00>CRE DAL202 A320 29.05 -81.20 360 FL100 250
+
+# Create ADSB background traffic (T-prefix, ignored by CONFLICTCAM)
+0:00:06.00>CRE TAAL303 B738 29.18 -81.30 90 FL120 220
+0:00:06.00>NORESO TAAL303
+
+# Start simulation
+0:00:08.00>OP
+0:00:09.00>FF

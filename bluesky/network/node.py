@@ -94,7 +94,13 @@ class Node(Entity):
                     continue
             
                 # Receive the message
-                ctx.msg = sock.recv_multipart()
+                # BluePlan: guard against AttributeError when ZMQ sockets are
+                # garbage-collected before the poller loop finishes at shutdown
+                # (was patches/bluesky/001_zmq_attributeerror.py).
+                try:
+                    ctx.msg = sock.recv_multipart()
+                except AttributeError:
+                    continue
                 if not ctx.msg:
                     # In the rare case that a message is empty, skip remaning processing
                     continue

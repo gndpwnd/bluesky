@@ -351,15 +351,50 @@ class MainWindow(QMainWindow, Base):
             self.console.keyPressEvent(event)
         event.accept()
 
+    # BluePlan: prevent the Qt GUI auto-closing when started as a subprocess.
+    # GNOME/mutter sends WM_DELETE_WINDOW to new windows, triggering closeEvent
+    # which would QUIT the BlueSky server and kill the whole run. Distinguish
+    # stack-command QUIT (event is None) from WM close events and ignore WM
+    # close events during the first 60s of startup.
+    # (was patches/bluesky/002_prevent_auto_close.py).
+    _startup_time = None
+
     @stack.command(name='QUIT', annotations='', aliases=('CLOSE', 'END', 'EXIT', 'Q', 'STOP'))
     def closeEvent(self, event=None):
+        import time
+        if self._startup_time is None:
+            self._startup_time = time.time()
+
+        # Stack command QUIT if called from stack (event is None)
+        if event is None:
+            if self.running:
+                self.running = False
+                if self.mode != 'client':
+                    bs.net.send(b'QUIT', to_group=bs.server.server_id)
+                # quit() exits the Qt event loop directly. We intentionally do
+                # NOT use closeAllWindows() here: closeAllWindows() delivers a
+                # closeEvent to every top-level window, which would re-enter
+                # this handler. For the deliberate stack-QUIT / headless /
+                # recorder-driven shutdown path we want a clean, immediate,
+                # non-re-entrant event-loop exit. This matches the final
+                # revision of the retired patches/bluesky/002_prevent_auto_close
+                # patch (commit 171a04e: "closeEvent: quit() instead of
+                # closeAllWindows()").
+                app.instance().quit()
+            return None
+        # Qt close event (from WM/compositor) — ignore during first 60s
+        elapsed = time.time() - self._startup_time
+        if elapsed < 60:
+            event.ignore()
+            return None
+        # After 60s, allow normal close. Here we keep closeAllWindows() (the
+        # original BlueSky behavior) so every top-level window receives a
+        # proper closeEvent for an orderly user-initiated WM shutdown.
         if self.running:
             self.running = False
-            # Send quit to server if we own it
             if self.mode != 'client':
                 bs.net.send(b'QUIT', to_group=bs.server.server_id)
             app.instance().closeAllWindows()
-            # return True
 
     @subscriber
     def echo(self, text, flags=None, sender_id=None):

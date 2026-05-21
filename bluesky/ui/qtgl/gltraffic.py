@@ -381,57 +381,96 @@ class Traffic(glh.RenderObject, layer=100):
             custacclr = getattr(data, 'custacclr', dict())
             custgrclr = getattr(data, 'custgrclr', dict())
 
-            zdata = zip(data.id, data.ingroup, data.inconf, data.tcpamax, data.trk, data.gs,
-                        data.cas, data.vs, data.alt, data.lat, data.lon)
-            for i, (acid, ingroup, inconf, tcpa,
-                    trk, gs, cas, vs, alt, lat, lon) in enumerate(zdata):
-                if i >= MAX_NAIRCRAFT:
-                    break
+            # BluePlan NaN safety: the label loop below int()-converts cas, alt
+            # and compares vs. A non-finite value (NaN/Inf) from a stall, an
+            # OpenAP edge case, or a live-ADSB aircraft with missing speed makes
+            # int(NaN) raise "ValueError: cannot convert float NaN to integer"
+            # inside this Qt signal handler, killing the render loop and the
+            # whole BlueSky process. Replace non-finite values with 0.0 so the
+            # label simply shows 000/-----. Was the qt_nan_safety monkey-patch
+            # plugin (bluesky_extensions/plugins/nan_safety.py).
+            # See docs/findings/qt-nan-crash-2026-04-18.md.
+            for _nan_field in ('cas', 'vs', 'alt'):
+                _arr = getattr(data, _nan_field, None)
+                if _arr is None:
+                    continue
+                try:
+                    _arr_np = np.asarray(_arr, dtype=float)
+                except (TypeError, ValueError):
+                    continue
+                _mask = ~np.isfinite(_arr_np)
+                if _mask.any():
+                    _arr_np[_mask] = 0.0
+                    try:
+                        setattr(data, _nan_field, _arr_np)
+                    except Exception:
+                        pass
 
-                # Make label: 3 lines of 8 characters per aircraft
-                if self.show_lbl >= 1:
-                    rawlabel += '%-8s' % acid[:8]
-                    if self.show_lbl == 2:
-                        if alt <= data.translvl:
-                            rawlabel += '%-5d' % int(alt / ft + 0.5)
+            # BluePlan NaN safety, layer 2 (belt-and-braces): the pre-pass
+            # above sanitizes cas/vs/alt, but a non-finite value could still
+            # slip past isfinite via some unanticipated edge case (e.g. a
+            # field this guard does not touch, such as a route label) and make
+            # an int() conversion below raise ValueError inside this Qt signal
+            # handler. Wrap the label/route render body and swallow ValueError
+            # so we drop one frame instead of killing the whole render loop
+            # and BlueSky process. Mirrors the second layer of the retired
+            # qt_nan_safety monkey-patch (bluesky_extensions/plugins/nan_safety.py).
+            try:
+                zdata = zip(data.id, data.ingroup, data.inconf, data.tcpamax, data.trk, data.gs,
+                            data.cas, data.vs, data.alt, data.lat, data.lon)
+                for i, (acid, ingroup, inconf, tcpa,
+                        trk, gs, cas, vs, alt, lat, lon) in enumerate(zdata):
+                    if i >= MAX_NAIRCRAFT:
+                        break
+
+                    # Make label: 3 lines of 8 characters per aircraft
+                    if self.show_lbl >= 1:
+                        rawlabel += '%-8s' % acid[:8]
+                        if self.show_lbl == 2:
+                            if alt <= data.translvl:
+                                rawlabel += '%-5d' % int(alt / ft + 0.5)
+                            else:
+                                rawlabel += 'FL%03d' % int(alt / ft / 100. + 0.5)
+                            vsarrow = 30 if vs > 0.25 else 31 if vs < -0.25 else 32
+                            rawlabel += '%1s  %-8d' % (chr(vsarrow),
+                                                       int(cas / kts + 0.5))
                         else:
-                            rawlabel += 'FL%03d' % int(alt / ft / 100. + 0.5)
-                        vsarrow = 30 if vs > 0.25 else 31 if vs < -0.25 else 32
-                        rawlabel += '%1s  %-8d' % (chr(vsarrow),
-                                                   int(cas / kts + 0.5))
+                            rawlabel += 16 * ' '
+
+                    if inconf:
+                        if self.ssd_conflicts:
+                            selssd[i] = 255
+                        color[i, :] = palette.conflict + (255,)
+                        lat1, lon1 = geo.qdrpos(lat, lon, trk, tcpa * gs / nm)
+                        cpalines[4 * confidx: 4 * confidx +
+                                 4] = [lat, lon, lat1, lon1]
+                        confidx += 1
                     else:
-                        rawlabel += 16 * ' '
+                        # Get custom color if available, else default
+                        rgb = palette.aircraft
+                        if ingroup:
+                            for groupmask, groupcolor in custgrclr.items():
+                                if ingroup & groupmask:
+                                    rgb = groupcolor
+                                    break
+                        rgb = custacclr.get(acid, rgb)
+                        color[i, :] = tuple(rgb) + (255,)
 
-                if inconf:
-                    if self.ssd_conflicts:
+                    #  Check if aircraft is selected to show SSD
+                    if self.ssd_all or acid in self.ssd_ownship:
                         selssd[i] = 255
-                    color[i, :] = palette.conflict + (255,)
-                    lat1, lon1 = geo.qdrpos(lat, lon, trk, tcpa * gs / nm)
-                    cpalines[4 * confidx: 4 * confidx +
-                             4] = [lat, lon, lat1, lon1]
-                    confidx += 1
-                else:
-                    # Get custom color if available, else default
-                    rgb = palette.aircraft
-                    if ingroup:
-                        for groupmask, groupcolor in custgrclr.items():
-                            if ingroup & groupmask:
-                                rgb = groupcolor
-                                break
-                    rgb = custacclr.get(acid, rgb)
-                    color[i, :] = tuple(rgb) + (255,)
 
-                #  Check if aircraft is selected to show SSD
-                if self.ssd_all or acid in self.ssd_ownship:
-                    selssd[i] = 255
+                if len(self.ssd_ownship) > 0 or self.ssd_conflicts or self.ssd_all:
+                    self.ssd.update(selssd=selssd)
+                self.cpalines.update(vertex=cpalines)
+                self.color.update(color)
+                self.lbl.update(np.array(rawlabel.encode('utf8'), dtype=np.bytes_))
 
-            if len(self.ssd_ownship) > 0 or self.ssd_conflicts or self.ssd_all:
-                self.ssd.update(selssd=selssd)
-            self.cpalines.update(vertex=cpalines)
-            self.color.update(color)
-            self.lbl.update(np.array(rawlabel.encode('utf8'), dtype=np.bytes_))
-            
-            # If there is a visible route, update the start position
-            if self.route_acid in data.id:
-                idx = data.id.index(self.route_acid)
-                self.route.vertex.update(np.array([data.lat[idx], data.lon[idx]], dtype=np.float32))
+                # If there is a visible route, update the start position
+                if self.route_acid in data.id:
+                    idx = data.id.index(self.route_acid)
+                    self.route.vertex.update(np.array([data.lat[idx], data.lon[idx]], dtype=np.float32))
+            except ValueError:
+                # Non-finite value reached an int() conversion despite the
+                # pre-pass — skip rendering this one frame to preserve the run.
+                return

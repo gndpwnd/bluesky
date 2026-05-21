@@ -8,9 +8,17 @@ from bluesky.network.common import genid, GROUPID_CLIENT, GROUPID_SIM, GROUPID_D
 
 class Client(Node):
     def __init__(self, group_id=GROUPID_CLIENT):
-        super().__init__(group_id)
+        # BluePlan: initialise acttopics (and discovery) BEFORE Node.__init__.
+        # Node.__init__ runs subscribe_all(), which replays actonly
+        # subscriptions registered at gltraffic import time through
+        # Client._subscribe — and that reads self.acttopics. With the original
+        # ordering (super().__init__ first) the first actonly replay crashes
+        # with "AttributeError: 'Client' object has no attribute 'acttopics'".
+        # Was folded in from the qt_nan_safety plugin's runtime patch.
+        # See docs/findings/vvv2-acttopics-regression-2026-04-22.md.
         self.acttopics = defaultdict(set)
         self.discovery = None
+        super().__init__(group_id)
 
         # Signals
         self.actnode_changed = Signal('actnode-changed')
