@@ -26,7 +26,6 @@ def main():
     # also advise latest version
     missingmodules = {"OpenGL": "pyopengl"}
 
-
     # Catch import errors
     try:
         # Parse command-line arguments
@@ -68,6 +67,11 @@ def main():
         print("Bluesky needs", modulename)
         print("Run setup-python.bat (Windows) or check requirements.txt (other systems)")
         print("Install using e.g. pip install", modulename)
+
+    finally:
+        # Shut down logging manager
+        from bluesky.logging_manager import shutdown_logging
+        shutdown_logging()
 
     print('BlueSky normal end.')
 

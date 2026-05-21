@@ -94,3 +94,27 @@ ssd.obj
 *-checkpoint.py
 *-checkpoint.ipynb
 .ropeproject/config.py
+
+# BluePlan: test-generated scenario artifacts (the runner/tests write here)
+/scenario/rt_*.scn
+/scenario/pp3_*.scn
+/scenario/dd2_*.scn
+/scenario/q2_*.scn
+/scenario/p3_*.scn
+/scenario/Coord_*.scn
+/scenario/CRELOG_*.scn
+/scenario/CRUD_*.scn
+/scenario/E2E_*.scn
+/scenario/Metadata_*.scn
+/scenario/Validation_*.scn
+/scenario/Workflow_*.scn
+/scenario/*_copy.scn
+/scenario/*_Test*.scn
+/scenario/bench_*.scn
+/scenario/writer_*.scn
+/scenario/preserves_id_test.scn
+/scenario/wpname_*.scn
+
+# BluePlan: ad-hoc dev scripts (proper test lives in bluesky/test/test_logging.py)
+/test_logging_integration.py
+/test_logging_simple.py

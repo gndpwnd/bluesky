@@ -55,6 +55,9 @@ def parse():
     parser.add_argument("--groupid", dest="group_id", action=GroupidAction,
                         help="Explicitly set a group part, or the entire connection id instead of randomly generating it.")
 
+    parser.add_argument("--debug", dest="debug", action="store_true", default=False,
+                        help="Enable debug mode with detailed logging of simulation events.")
+
     cmdargs = parser.parse_args()
 
     return vars(cmdargs)

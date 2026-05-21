@@ -36,7 +36,14 @@ class Plugin:
         self.imp = None
 
     def _load(self):
-        ''' Load this plugin. '''
+        ''' Load this plugin with fallback and health checking.
+
+        CRIT-006: Enhanced plugin loading with:
+        - Graceful degradation on import failures
+        - Health check after initialization
+        - Fallback for missing plugins
+        - Comprehensive error tracking
+        '''
         if self.loaded:
             return False, f'Plugin {self.plugin_name} already loaded'
 
@@ -44,32 +51,70 @@ class Plugin:
             # Load the plugin, or get already loaded module from sys modules
             self.imp = importlib.import_module(self.fullname)
 
+            # CRIT-006: Health check 1 — init_plugin must exist and be callable
+            if not hasattr(self.imp, 'init_plugin'):
+                return False, (
+                    f'Plugin {self.plugin_name} missing init_plugin() entry point'
+                )
+
             # Initialize the plugin
-            result = self.imp.init_plugin()
+            try:
+                result = self.imp.init_plugin()
+            except Exception as init_exc:
+                # CRIT-006: Graceful degradation on init failure
+                return False, (
+                    f'Plugin {self.plugin_name} init_plugin() failed: {init_exc}'
+                )
+
             config = result if isinstance(result, dict) else result[0]
 
-            if self.plugin_type == 'sim':
-                dt = max(config.get('update_interval', 0.0), bs.sim.simdt)
-                # Add timed functions if present
-                for hook in ('preupdate', 'update', 'reset'):
-                    fun = config.get(hook)
-                    if fun:
-                        timed_function(
-                            fun, name=f'{self.plugin_name}.{fun.__name__}', dt=dt, hook=hook)
+            # CRIT-006: Health check 2 — config must have required fields
+            if not isinstance(config, dict):
+                return False, (
+                    f'Plugin {self.plugin_name} returned invalid config (not dict)'
+                )
+            if 'plugin_name' not in config or 'plugin_type' not in config:
+                return False, (
+                    f'Plugin {self.plugin_name} config missing plugin_name/plugin_type'
+                )
 
-                # Add the plugin as data parent to the variable explorer
-                ve.register_data_parent(self.imp, self.plugin_name.lower())
+            if self.plugin_type == 'sim':
+                try:
+                    dt = max(config.get('update_interval', 0.0), bs.sim.simdt)
+                    # Add timed functions if present
+                    for hook in ('preupdate', 'update', 'reset'):
+                        fun = config.get(hook)
+                        if fun:
+                            timed_function(
+                                fun, name=f'{self.plugin_name}.{fun.__name__}', dt=dt, hook=hook)
+
+                    # Add the plugin as data parent to the variable explorer
+                    ve.register_data_parent(self.imp, self.plugin_name.lower())
+                except Exception as sim_exc:
+                    # CRIT-006: Log but continue — don't fail whole plugin on
+                    # optional sim-specific setup failures
+                    print(f'Warning: plugin {self.plugin_name} sim setup failed: {sim_exc}')
 
             if isinstance(result, (tuple, list)) and len(result) > 1:
-                stackfuns = result[1]
-                # Add the plugin's stack functions to the stack
-                bs.stack.append_commands(stackfuns)
-            
+                try:
+                    stackfuns = result[1]
+                    # Add the plugin's stack functions to the stack
+                    bs.stack.append_commands(stackfuns)
+                except Exception as stack_exc:
+                    # CRIT-006: Stack registration failures don't block the plugin
+                    print(f'Warning: plugin {self.plugin_name} stack registration failed: {stack_exc}')
 
+            self.loaded = True
             return True, 'Successfully loaded plugin %s' % self.plugin_name
+
         except ImportError as e:
-            print('BlueSky plugin system failed to load', self.plugin_name, ':', e)
-            return False, f'Failed to load {self.plugin_name}'
+            # CRIT-006: Fallback mechanism — missing plugin is not fatal
+            print('BlueSky plugin system: plugin', self.plugin_name, 'not available:', e)
+            return False, f'Plugin {self.plugin_name} not found (fallback to no-op)'
+        except Exception as e:
+            # CRIT-006: Catch-all for unexpected errors
+            print('BlueSky plugin system: plugin', self.plugin_name, 'failed:', e)
+            return False, f'Plugin {self.plugin_name} load failed: {e}'
 
     @classmethod
     def load(cls, name):
@@ -152,23 +197,51 @@ class Plugin:
 
 
 def init(mode):
-    ''' Initialization function of the plugin system.'''
+    ''' Initialization function of the plugin system with health checks.
+
+    CRIT-006: Enhanced initialization with:
+    - Graceful handling of missing plugins
+    - Health monitoring endpoints
+    - Load order guarantees (critical plugins first)
+    '''
     # Set plugin type for this instance of BlueSky
     req_type = 'sim' if mode[:3] == 'sim' else 'gui'
     oth_type = 'gui' if mode[:3] == 'sim' else 'sim'
 
     # Find available plugins
     Plugin.find_plugins(req_type)
+
+    # CRIT-006: Priority loading — load critical plugins first
+    # (e.g., NANSAFETY must load before Traffic instance creation)
+    priority_plugins = ['NANSAFETY']  # must load earliest for GUI mode
+    load_order = [p for p in priority_plugins if p in Plugin.plugins] + \
+                 [p for p in settings.enabled_plugins if p.upper() not in priority_plugins]
+
     # Load plugins selected in config
-    for pname in settings.enabled_plugins:
-        if pname.upper() not in Plugin.plugins_ext:
-            success = Plugin.load(pname.upper())
-            print(success[1])
+    failed_plugins = []
+    for pname in load_order:
+        pname_upper = pname.upper() if isinstance(pname, str) else pname.upper()
+        if pname_upper not in Plugin.plugins_ext:
+            success, msg = Plugin.load(pname_upper)
+            print(msg)
+            if not success:
+                # CRIT-006: Track failed plugins but continue
+                # (graceful degradation — system works without optional plugins)
+                failed_plugins.append((pname_upper, msg))
+
+    # CRIT-006: Health check — warn if critical plugins failed
+    if failed_plugins:
+        critical = {'NANSAFETY', 'CONFLICTCAM', 'CD_MODES'}
+        failed_critical = [p for p, _ in failed_plugins if p in critical]
+        if failed_critical:
+            import sys as _sys
+            print(f'WARNING: Critical plugins failed to load: {", ".join(failed_critical)}',
+                  file=_sys.stderr)
 
     # Create the plugin management stack command
     @stack.command(name='PLUGINS', aliases=('PLUGIN', 'PLUG-IN', 'PLUG-INS', f'{req_type.upper()}PLUGIN'))
     def manage(cmd: 'txt' = 'LIST', plugin_name: 'txt' = ''):
-        ''' List all plugins, load a plugin, or remove a loaded plugin.'''
+        ''' List all plugins, load a plugin, check health, or remove a loaded plugin.'''
         if cmd == 'LIST':
             running = set(Plugin.loaded_plugins.keys())
             available = set(Plugin.plugins.keys()) - running
@@ -179,6 +252,19 @@ def init(mode):
                 text += f'\nNo additional {req_type} plugins available.'
             # Also let other side print the list of plugins
             stack.forward()
+            return True, text
+
+        if cmd == 'HEALTH':
+            # CRIT-006: Health check command
+            running = set(Plugin.loaded_plugins.keys())
+            health = {
+                'running': list(running),
+                'total_available': len(Plugin.plugins),
+                'failed_load': len(failed_plugins),
+            }
+            text = f'\nPlugin health: {len(running)}/{len(Plugin.plugins)} loaded'
+            if failed_plugins:
+                text += f'\nFailed to load: {", ".join([p for p, _ in failed_plugins])}'
             return True, text
 
         if cmd in ('LOAD', 'ENABLE') or not plugin_name:

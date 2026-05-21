@@ -17,6 +17,7 @@ from bluesky.core.walltime import Timer
 from bluesky.core.timedfunction import hooks
 from bluesky.stack import simstack, recorder
 from bluesky.tools import datalog, areafilter, plotter
+from bluesky.logging_manager import get_logger
 
 
 # Minimum sleep interval
@@ -117,8 +118,15 @@ class Simulation(Base):
             datalog.update()
             hooks.preupdate.trigger()
 
-            # Determine interval towards next timestep                
+            # Determine interval towards next timestep
             self.simt, self.simdt = simtime.step(dt_increment)
+
+            # Log simulation tick (debug mode)
+            logger = get_logger()
+            if logger:
+                logger.log_simulation_tick(self.simt, wall_time=time.time())
+                # Update aircraft count
+                logger.update_stats(aircraft_count=bs.traf.ntraf)
 
             # Update UTC time
             self.utc += datetime.timedelta(seconds=self.simdt)
@@ -181,6 +189,10 @@ class Simulation(Base):
             This function is called when a QUIT signal is received from
             the server, or when quit is called. '''
         print(f'Simulation node {bs.net.node_id} quitting.')
+        # Log state change
+        logger = get_logger()
+        if logger:
+            logger.set_state(logger.STATE_STOPPED)
         self.state = bs.END
 
     def op(self):
@@ -190,6 +202,10 @@ class Simulation(Base):
         self.ffstop = None
         self.state = bs.OP
         self.set_dtmult(1.0)
+        # Log state change
+        logger = get_logger()
+        if logger:
+            logger.set_state(logger.STATE_RUNNING)
 
     def hold(self):
         ''' Set simulation state to HOLD. '''
@@ -197,6 +213,10 @@ class Simulation(Base):
         self.state = bs.HOLD
         self.ffmode = False
         self.ffstop = None
+        # Log state change
+        logger = get_logger()
+        if logger:
+            logger.set_state(logger.STATE_PAUSED)
 
 
     def reset(self):

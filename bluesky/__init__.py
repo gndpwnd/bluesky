@@ -30,7 +30,7 @@ server = None
 
 
 def init(mode='sim', configfile=None, scenfile=None, discoverable=False,
-         gui=None, detached=False, workdir=None, group_id=None, **kwargs):
+         gui=None, detached=False, workdir=None, group_id=None, debug=False, **kwargs):
     ''' Initialize bluesky modules.
 
         Arguments:
@@ -44,6 +44,7 @@ def init(mode='sim', configfile=None, scenfile=None, discoverable=False,
         - workdir: Pass a custom working directory (instead of cwd or ~/bluesky)
         - group_id: Explicitly set (part of) the connection identifier string.
                     Server does this when spawning a node
+        - debug: Enable debug mode with detailed logging [True/False]
     '''
 
     # Argument checking
@@ -65,6 +66,12 @@ def init(mode='sim', configfile=None, scenfile=None, discoverable=False,
     globals()['gui'] = gui
 
     global server, traf, sim, scr, net, navdb
+
+    # Initialize logging manager (check for env var override)
+    import os
+    debug_enabled = debug or os.getenv('BLUESKY_DEBUG', '0') == '1'
+    from bluesky.logging_manager import init_logging
+    init_logging(debug=debug_enabled)
 
     # Initialise resource localisation, and set custom working directory if present
     from bluesky import pathfinder
