@@ -131,6 +131,15 @@ class CSVLogger:
 
     def addvars(self, selection):
         selvars = []
+        # CRELOG auto-prepends ``simt`` to every row (see ``log`` / ``open``
+        # below). Tolerate scenarios that pass ``simt``/``simtime`` as an
+        # explicit leading column: silently drop it instead of failing the
+        # whole ADD (which would leave ``selvars`` empty and produce a TSV
+        # with just the ``simt`` header). This makes
+        # ``POSITIONS ADD simtime,traf.id,traf.lat,...`` work the same as
+        # ``POSITIONS ADD traf.id,traf.lat,...``.
+        while selection and selection[0].lower() in ('simt', 'simtime'):
+            del selection[0]
         while selection:
             parent = ''
             if selection[0].upper() == 'FROM':
@@ -144,6 +153,16 @@ class CSVLogger:
                 if varobj:
                     selvars.append(varobj)
                 else:
+                    # Surface the failure on stderr so headless runs (which
+                    # have no connected client to receive the echo) can
+                    # diagnose missing-column TSVs from ``stdout.log``.
+                    import sys
+                    print(
+                        f"[datalog] {self.name} ADD: variable "
+                        f"'{parent + v}' not found — selvars cleared, "
+                        f"TSV will contain only the simt column",
+                        file=sys.stderr,
+                    )
                     return False, f'Variable {v} not found'
 
         self.selvars = selvars
