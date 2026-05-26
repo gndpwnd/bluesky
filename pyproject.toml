@@ -10,6 +10,7 @@ dependencies = [
     "zmq",
     "bluesky-navdata",
     "openap",
+    "psutil >= 5.9",  # BluePlan: used by bluesky/logging_manager.py
 ]
 
 authors = [
