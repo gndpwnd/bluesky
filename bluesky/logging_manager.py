@@ -98,9 +98,25 @@ class LoggingManager:
         self._write_log(self.LEVEL_INFO, "BlueSky Logging Manager initialized",
                        f"Debug mode: {self.debug}, Log file: {self.log_file}")
 
-        # Start heartbeat thread
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
+        # Start heartbeat thread only when explicitly requested (debug mode or
+        # BLUESKY_HEARTBEAT=1). The heartbeat writes to stdout every
+        # HEARTBEAT_INTERVAL seconds, which defeats stdout-staleness watchdogs
+        # in downstream wrappers (e.g. BluePlan's runner.py
+        # LOG_STALENESS_THRESHOLD fast-path that relies on stdout going silent
+        # after "BlueSky normal end." to clean up the script-pty-wrapped
+        # server-gui process tree). With heartbeats always-on the wrapper
+        # never sees staleness, never fires the normal_end_detected fast-path,
+        # and the run appears to hang for the full WALL_TIMEOUT_GUI (3600s)
+        # before the watchdog kills it.
+        # See docs/handoffs/canary-sim-time-bisect-2026-05-26.md.
+        heartbeat_enabled = (
+            self.debug or os.getenv('BLUESKY_HEARTBEAT', '0') == '1'
+        )
+        if heartbeat_enabled:
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
+        else:
+            self.heartbeat_thread = None
 
     def _write_log(self, level: str, message: str, extra_info: str = ""):
         """
