@@ -8,6 +8,25 @@ from bluesky.tools.aero import nm, ft
 # Metrics object
 metrics = None
 
+
+# BluePlan-obs B5 (Pattern P-F, UG-21/UG-25): per-plugin update-hook error
+# counter; see conflictcam.py for the rationale and the `[PLUGIN_UPDATE_ERROR]`
+# stdout contract.
+_update_errors_total = 0
+_update_errors_logged = 0
+
+
+def _b5_record_update_error(plugin, e):
+    global _update_errors_total, _update_errors_logged
+    _update_errors_total += 1
+    if _update_errors_logged < 3 or _update_errors_total % 1000 == 0:
+        _update_errors_logged += 1
+        print(
+            f'[PLUGIN_UPDATE_ERROR] plugin={plugin} '
+            f'reason={type(e).__name__}: {e}',
+            flush=True,
+        )
+
 class SectorData:
     # Selected traffic data for a/c in a sector
     def __init__(self):
@@ -78,6 +97,16 @@ class Metrics(Entity):
     @timed_function(dt=2.5)
     def update(self):
         ''' Periodic update function for metrics calculation. '''
+        # BluePlan-obs B5 (UG-21): guard the tick body so a single bad frame
+        # cannot kill the timed-function callback for the rest of the run.
+        try:
+            self._b5_update_body()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            _b5_record_update_error(__name__, e)
+
+    def _b5_update_body(self):
         self.sectorsd = np.zeros(len(self.sectors))
         self.sectorconv = np.zeros(len(self.sectors))
         self.sectoreff = []

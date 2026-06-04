@@ -44,6 +44,27 @@ from bluesky import core, stack, traf, sim
 conflictcam = None
 
 
+# BluePlan-obs B5 (Pattern P-F, UG-21/UG-25): per-plugin update-hook error
+# counter. Without this guard a single traceback in update() silently kills
+# the timed-function callback and the plugin appears "loaded" but inert. The
+# `[PLUGIN_UPDATE_ERROR]` prefix is the durable stdout signal consumed by
+# the runner's output_handler scanner.
+_update_errors_total = 0
+_update_errors_logged = 0
+
+
+def _b5_record_update_error(plugin, e):
+    global _update_errors_total, _update_errors_logged
+    _update_errors_total += 1
+    if _update_errors_logged < 3 or _update_errors_total % 1000 == 0:
+        _update_errors_logged += 1
+        print(
+            f'[PLUGIN_UPDATE_ERROR] plugin={plugin} '
+            f'reason={type(e).__name__}: {e}',
+            flush=True,
+        )
+
+
 def _to_tuple_set(pairs):
     """Convert a collection of pairs to a set of tuples.
 
@@ -274,28 +295,35 @@ class ConflictCam(core.Entity):
     @core.timed_function(name='conflictcam', dt=1.0)
     def update(self):
         """Check trigger condition every simulation second."""
-        if not self.active or traf.ntraf == 0:
-            return
+        # BluePlan-obs B5 (UG-21): guard the tick body so a single bad frame
+        # cannot kill the timed-function callback for the rest of the run.
+        try:
+            if not self.active or traf.ntraf == 0:
+                return
 
-        # Get the trigger function
-        trigger_entry = TRIGGER_CONDITIONS.get(self.trigger_name)
-        if not trigger_entry:
-            return
+            # Get the trigger function
+            trigger_entry = TRIGGER_CONDITIONS.get(self.trigger_name)
+            if not trigger_entry:
+                return
 
-        trigger_fn = trigger_entry[0]
-        should_trigger, description = trigger_fn(self)
+            trigger_fn = trigger_entry[0]
+            should_trigger, description = trigger_fn(self)
 
-        # Clean up stale state for deleted aircraft
-        current_ids = set(traf.id)
-        stale = [k for k in self.prev_state if k not in current_ids and k != '__all_conf__']
-        for k in stale:
-            del self.prev_state[k]
+            # Clean up stale state for deleted aircraft
+            current_ids = set(traf.id)
+            stale = [k for k in self.prev_state if k not in current_ids and k != '__all_conf__']
+            for k in stale:
+                del self.prev_state[k]
 
-        # Take screenshot if triggered and cooldown has elapsed
-        if should_trigger:
-            elapsed = sim.simt - self.last_screenshot_time
-            if elapsed >= self.cooldown_sec:
-                self._take_screenshot(description)
+            # Take screenshot if triggered and cooldown has elapsed
+            if should_trigger:
+                elapsed = sim.simt - self.last_screenshot_time
+                if elapsed >= self.cooldown_sec:
+                    self._take_screenshot(description)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            _b5_record_update_error(__name__, e)
 
     def _take_screenshot(self, description=''):
         """Trigger a screenshot via BlueSky's screen capture."""

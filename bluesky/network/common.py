@@ -109,6 +109,16 @@ def get_ownip():
         for addr in local_addrs:
             if not addr.startswith('127'):
                 return addr
-    except:
-        pass
+    except (socket.gaierror, socket.herror, OSError) as e:
+        # BluePlan-obs B5 (Pattern P-C, UG-26): bare-except → typed except.
+        # DNS misconfig was previously invisible — now we log once so the
+        # `127.0.0.1` fallback is at least traceable.
+        try:
+            print(
+                f'[OWNIP_LOOKUP_FAIL] reason={type(e).__name__}: {e} '
+                f'(falling back to 127.0.0.1)',
+                flush=True,
+            )
+        except Exception:
+            pass
     return '127.0.0.1'

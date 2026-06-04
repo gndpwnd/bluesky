@@ -32,6 +32,30 @@ from .pair import PairFilterDetect  # noqa: F401
 from .vtol_vs_adsb import VtolVsAdsbDetect, DEFAULT_VTOL_TYPES  # noqa: F401
 
 
+# BluePlan-obs B5 (Pattern P-F, UG-21/UG-25): per-plugin update-hook error
+# counter. CD_MODES has no @timed_function tick callback of its own — its
+# per-frame work runs inside ``BaseFilterDetect.detect`` (base.py), invoked
+# by BlueSky's ConflictDetection layer once per sim step. We still expose the
+# `[PLUGIN_UPDATE_ERROR]` counter here so the stack-command path
+# (`_cdconfig`) and `init_plugin` can use a single per-plugin reporting
+# channel; the runner's output_handler scanner consumes the same prefix
+# across all plugins.
+_update_errors_total = 0
+_update_errors_logged = 0
+
+
+def _b5_record_update_error(plugin, e):
+    global _update_errors_total, _update_errors_logged
+    _update_errors_total += 1
+    if _update_errors_logged < 3 or _update_errors_total % 1000 == 0:
+        _update_errors_logged += 1
+        print(
+            f'[PLUGIN_UPDATE_ERROR] plugin={plugin} '
+            f'reason={type(e).__name__}: {e}',
+            flush=True,
+        )
+
+
 def init_plugin():
     """BlueSky plugin entry point.
 
@@ -66,6 +90,20 @@ def _cdconfig(param: str = "", value: str = ""):
     Returns ``(ok, message)``. Lazy-imports BlueSky so this module can still
     be imported in unit tests.
     """
+    # BluePlan-obs B5 (UG-21): outer guard so an unexpected exception inside
+    # the dispatch does not propagate to BlueSky's stack handler and silently
+    # drop the user's CDCONFIG command. The per-branch try/excepts below stay
+    # so callers still get the structured "(ok, message)" contract.
+    try:
+        return _cdconfig_impl(param, value)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        _b5_record_update_error(__name__, e)
+        return False, f"CDCONFIG: internal error ({type(e).__name__}: {e})"
+
+
+def _cdconfig_impl(param: str = "", value: str = ""):
     try:
         from bluesky.traffic.asas import ConflictDetection  # type: ignore
     except Exception as exc:  # pragma: no cover

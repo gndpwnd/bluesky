@@ -109,6 +109,60 @@ settings.set_variable_defaults(adsb_json_host="localhost", adsb_json_port=10901)
 # ADS-B callsign prefix — distinguishes live feed aircraft from user scenario aircraft
 ADSB_CALLSIGN_PREFIX = "T"
 
+# UG-01 / UG-02 — module-level decode-rejection counters. Protected by a
+# lock so the receiver thread and the BlueSky-sim thread can both increment
+# safely. Logging is verbatim for the first 3 of each class so operators
+# see the exact failure; after that, one-in-N rate limiting prevents log
+# spam. A periodic summary is emitted every SUMMARY_INTERVAL_SEC wall-clock
+# seconds (driven from update()), and a final summary on shutdown.
+_decode_lock = threading.Lock()
+_decode_counters = {
+    "accepted_records": 0,
+    "json_parse_failures": 0,
+    "missing_required_field_drops": 0,
+    # Per-field drop breakdown for missing-required-field (UG-02).
+    "missing_field_icao": 0,
+    "missing_field_lat": 0,
+    "missing_field_lon": 0,
+}
+# How many of each class to log verbatim before rate limiting kicks in.
+_VERBOSE_LOG_FIRST_N = 3
+# After verbose limit, log every Nth occurrence.
+_RATE_LIMIT_SAMPLE_EVERY = 100
+# Wall-clock interval between periodic summaries from update().
+_SUMMARY_INTERVAL_SEC = 60.0
+
+
+def _increment_counter(name: str, n: int = 1) -> int:
+    """Thread-safe counter increment. Returns the post-increment value."""
+    with _decode_lock:
+        new = _decode_counters.get(name, 0) + n
+        _decode_counters[name] = new
+        return new
+
+
+def _get_counter_snapshot() -> dict:
+    """Thread-safe snapshot of all counters."""
+    with _decode_lock:
+        return dict(_decode_counters)
+
+
+def _log_counter_summary(tag: str = "periodic") -> None:
+    """Emit a one-line summary of decode counters. Safe to call any time."""
+    snap = _get_counter_snapshot()
+    print(
+        "[ADSBFEEDJSON] decode_summary (%s): accepted=%d json_parse_failures=%d "
+        "missing_required_field_drops=%d (icao=%d lat=%d lon=%d)" % (
+            tag,
+            snap.get("accepted_records", 0),
+            snap.get("json_parse_failures", 0),
+            snap.get("missing_required_field_drops", 0),
+            snap.get("missing_field_icao", 0),
+            snap.get("missing_field_lat", 0),
+            snap.get("missing_field_lon", 0),
+        )
+    )
+
 # Connection retry settings
 RETRY_INTERVAL_SEC = 5.0    # Seconds between connection retry attempts
 MAX_RETRY_INTERVAL = 30.0   # Maximum backoff interval
@@ -218,6 +272,10 @@ class JsonFeedReader:
         self._startup_logged = False       # STARTUP banner emitted once
         self._silence_warned = False       # 60s-no-traffic warning fires once
         self._refused_logged = False       # Refused-connection error fires once
+
+        # UG-01 / UG-02: wall-clock of last periodic decode-counter summary
+        # (driven from update() so it runs without a background thread).
+        self._last_decode_summary = 0.0
 
     @property
     def is_connected(self):
@@ -447,6 +505,10 @@ class JsonFeedReader:
             self.acpool.clear()
             self._perf_applied.clear()
             print("[ADSBFEEDJSON] Disconnected, removed %d aircraft" % count)
+        # UG-01 / UG-02: emit a final summary so the operator sees the
+        # session-totals at the moment the stream ends (covers QUIT / OFF
+        # paths as well as bridge-side disconnect).
+        _log_counter_summary("disconnect")
 
     def _receiver(self):
         """Background thread: receive data and buffer it (thread-safe)."""
@@ -487,8 +549,22 @@ class JsonFeedReader:
             try:
                 msg = json.loads(line)
                 messages.append(msg)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                # UG-01: previously silently dropped. Now: count + verbose-log
+                # the first N exceptions, then sample 1-in-N.
+                total = _increment_counter("json_parse_failures")
+                if total <= _VERBOSE_LOG_FIRST_N:
+                    # Truncate the line so a runaway buffer can't flood logs.
+                    snippet = line[:240]
+                    print(
+                        "[ADSBFEEDJSON] WARNING: json.loads failed "
+                        "(failure #%d): %s | line=%r" % (total, e, snippet)
+                    )
+                elif total % _RATE_LIMIT_SAMPLE_EVERY == 0:
+                    print(
+                        "[ADSBFEEDJSON] WARNING: json.loads failed "
+                        "(failure #%d, sampled): %s" % (total, e)
+                    )
 
         # Put unparsed remainder back
         if buf:
@@ -566,7 +642,39 @@ class JsonFeedReader:
             hdg = msg.get("hdg")
 
             if not icao or lat is None or lon is None:
+                # UG-02: previously silently dropped. Now: count which
+                # specific required field was missing and log the first N
+                # offending payloads, then sample 1-in-N.
+                if not icao:
+                    _increment_counter("missing_field_icao")
+                if lat is None:
+                    _increment_counter("missing_field_lat")
+                if lon is None:
+                    _increment_counter("missing_field_lon")
+                total = _increment_counter("missing_required_field_drops")
+                if total <= _VERBOSE_LOG_FIRST_N:
+                    missing = []
+                    if not icao:
+                        missing.append("icao")
+                    if lat is None:
+                        missing.append("lat")
+                    if lon is None:
+                        missing.append("lon")
+                    print(
+                        "[ADSBFEEDJSON] WARNING: missing required field(s) %s "
+                        "(drop #%d): msg=%r" % (
+                            ",".join(missing), total, msg)
+                    )
+                elif total % _RATE_LIMIT_SAMPLE_EVERY == 0:
+                    print(
+                        "[ADSBFEEDJSON] WARNING: missing required field "
+                        "(drop #%d, sampled)" % total
+                    )
                 continue
+
+            # UG-01/UG-02: count an accepted record once required-field
+            # validation has passed.
+            _increment_counter("accepted_records")
 
             # Build callsign with T-prefix for mixed mode identification
             raw_callsign = msg.get("callsign", icao).strip().upper()[:8] or icao
@@ -603,6 +711,16 @@ class JsonFeedReader:
         if self._msg_count > 0 and self._msg_count % 100 == 0:
             print("[ADSBFEEDJSON] Status: %d aircraft in pool, %d in sim, %d created, %d messages total" % (
                 len(self.acpool), traf.ntraf, self._inject_count, self._msg_count))
+
+        # UG-01 / UG-02: wall-clock-driven decode-counter summary so the
+        # operator sees totals even when no good messages are flowing (the
+        # ``_msg_count % 100`` path above won't fire on a stream of pure
+        # garbage). Single-shot, lock-free check against a local timestamp.
+        if (
+            now - self._last_decode_summary >= _SUMMARY_INTERVAL_SEC
+        ):
+            _log_counter_summary("periodic")
+            self._last_decode_summary = now
 
     def _set_area(self, area_str):
         """Set area filter from 'lat,lon,radius_nm' string."""

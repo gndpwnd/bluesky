@@ -95,7 +95,18 @@ def process(ext_cmds=None):
         # Command not found
         # -------------------------------------------------------------------
         elif Stack.sender_id is None:
-            # Command came from scenario file: assume it's a gui/client command and send it on
+            # Command came from scenario file: assume it's a gui/client command and send it on.
+            # BluePlan-obs (UG-06 / A1 G1): forward() previously dropped the
+            # line on the floor when no GUI was attached. Emit an ECHO with
+            # a 'syntax_warning' tag *before* forwarding so the bus
+            # subscriber sees attempted-and-forwarded scenario commands even
+            # in headless mode.
+            print(f'[ECHO] flags=syntax_warning text=forwarded-unknown-cmd: {cmdline}')
+            try:
+                echo(f'forwarded unknown command: {cmdline}', bs.BS_CMDERR)
+            except Exception:
+                # Defensive: ECHO send failure should not block forwarding.
+                pass
             forward()
         else:
             success = False
@@ -105,11 +116,21 @@ def process(ext_cmds=None):
             else:
                 echotext = f'Unknown command: {cmd}'
 
-        # Recording of actual validated commands
+        # Recording of actual validated commands.
+        # BluePlan-obs (UG-07 / A1 G2): also persist *attempted-but-rejected*
+        # lines as a stdout audit trail (prefixed) so post-run analysis can
+        # see which commands were typed and dropped. CRELOG itself stays
+        # success-only to avoid breaking the existing TSV schema; the
+        # sidecar is the prefix-line audit.
         if success:
             recorder.savecmd(cmdu, cmdline)
-        elif not Stack.sender_id:
-            echotext = f'{cmdline}\n{echotext}'
+        else:
+            # BluePlan-obs (UG-07 / A1 G2): surface attempted-but-rejected
+            # commands regardless of sender (scenario or client). Preserve
+            # the original scenario-side echo formatting.
+            if not Stack.sender_id:
+                echotext = f'{cmdline}\n{echotext}'
+            print(f'[CMD_REJECTED] flags={echoflags} cmd={cmdu} line={cmdline}')
 
         # Always return on command
         if echotext:

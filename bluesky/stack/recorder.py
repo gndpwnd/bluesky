@@ -60,8 +60,16 @@ def saveic(filename: 'word' = ''):
 
     try:
         f = open(filename, "w")
-    except:
-        return False, "Error writing to file"
+    except (OSError, PermissionError) as e:
+        # BluePlan-obs B5 (Pattern P-C, UG-26): bare-except → typed except
+        # with errno/path context. The prior bare `except:` swallowed
+        # KeyboardInterrupt and returned a useless one-line error.
+        reason = f'{type(e).__name__}: {e} (path={filename})'
+        try:
+            print(f'[RECORDER_OPEN_FAIL] {reason}', flush=True)
+        except Exception:
+            pass
+        return False, f"Error writing to file: {reason}"
 
     # Write files
     timtxt = "00:00:00.00>"  # Current time will be zero

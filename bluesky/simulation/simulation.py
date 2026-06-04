@@ -71,13 +71,15 @@ class Simulation(Base):
     def run(self):
         ''' Start the main loop of this simulation. '''
         # When This function is run, BlueSky controls the main loop
-        # In this case, connect to system ABORT/INTERRUPT signal to 
+        # In this case, connect to system ABORT/INTERRUPT signal to
         # allow BlueSky to quit cleanly when an interrupt/kill signal
         # is received
-        signal.signal(signal.SIGINT, lambda *args: self.quit())
-        signal.signal(signal.SIGTERM, lambda *args: self.quit())
+        # BluePlan-obs (UG-05): tag the QUIT cause so the bus subscriber can
+        # distinguish stack-driven quits from signal-driven ones.
+        signal.signal(signal.SIGINT, lambda *args: self.quit(via='signal'))
+        signal.signal(signal.SIGTERM, lambda *args: self.quit(via='signal'))
         if platform.system() == 'Windows':
-            signal.signal(getattr(signal, 'SIGBREAK'), lambda *args: self.quit())
+            signal.signal(getattr(signal, 'SIGBREAK'), lambda *args: self.quit(via='signal'))
 
 
         while self.state != bs.END:
@@ -171,6 +173,10 @@ class Simulation(Base):
 
         # Stop fast-time/benchmark if enabled and set interval has passed
         if self.ffstop is not None and self.simt >= self.ffstop:
+            # BluePlan-obs (UG-05): mark the end of the fast-forward window
+            # before falling through to hold()/op(); both emit their own
+            # STATE prefix.
+            print(f'[FF_END] simt={self.simt:.3f} stop_simt={self.ffstop:.3f}')
             if self.benchdt > 0.0:
                 simstack.echo('Benchmark complete: %d samples in %.3f seconds.' %
                             (bs.scr.samplecount, time.time() - self.bencht))
@@ -184,10 +190,18 @@ class Simulation(Base):
             self.pub_simstate.send_replace(to_group=bs.net.server_id)
             self.prevstate = self.state
 
-    def quit(self):
+    def quit(self, via='stack'):
         ''' Quit simulation.
             This function is called when a QUIT signal is received from
             the server, or when quit is called. '''
+        # BluePlan-obs (UG-05): prefix lines for the bus subscriber. `via` is
+        # 'signal' when triggered from SIGINT/SIGTERM/SIGBREAK and 'stack'
+        # otherwise. Also emit a SIMT_END marker with final wall/sim time so
+        # runner-side audits can correlate the last simt with reap-time.
+        prev = self.state
+        print(f'[STATE] {prev}->END')
+        print(f'[SIMT_END] simt={self.simt:.3f} ntraf={getattr(bs.traf, "ntraf", 0)} wall={time.time():.3f}')
+        print(f'[QUIT] via={via}')
         print(f'Simulation node {bs.net.node_id} quitting.')
         # Log state change
         logger = get_logger()
@@ -197,11 +211,14 @@ class Simulation(Base):
 
     def op(self):
         ''' Set simulation state to OPERATE. '''
+        # BluePlan-obs (UG-05): prefix line for the bus subscriber.
+        prev = self.state
         self.syst = time.time() + self.simdt
         self.ffmode = False
         self.ffstop = None
         self.state = bs.OP
         self.set_dtmult(1.0)
+        print(f'[STATE] {prev}->OP')
         # Log state change
         logger = get_logger()
         if logger:
@@ -209,10 +226,13 @@ class Simulation(Base):
 
     def hold(self):
         ''' Set simulation state to HOLD. '''
+        # BluePlan-obs (UG-05): prefix line for the bus subscriber.
+        prev = self.state
         self.syst = time.time() + self.simdt / self.dtmult
         self.state = bs.HOLD
         self.ffmode = False
         self.ffstop = None
+        print(f'[STATE] {prev}->HOLD')
         # Log state change
         logger = get_logger()
         if logger:
@@ -221,6 +241,11 @@ class Simulation(Base):
 
     def reset(self):
         ''' Reset all simulation objects. '''
+        # BluePlan-obs (UG-05): prefix lines for the bus subscriber. Capture
+        # the prior simt before the reset clears it so a mid-scenario reset
+        # is observable.
+        prev = self.state
+        prev_simt = self.simt
         self.state = bs.INIT
         self.syst = -1.0
         self.simt = 0.0
@@ -240,6 +265,14 @@ class Simulation(Base):
         bs.scr.reset()
         plotter.reset()
 
+        print(f'[STATE] {prev}->INIT')
+        print(f'[RESET] from simt={prev_simt:.3f}')
+        # BluePlan-obs (UG-05 / A5 G5): mirror op()/hold()/quit() — log the
+        # state transition so the session log reflects the reset.
+        logger = get_logger()
+        if logger:
+            logger.set_state(logger.STATE_PAUSED)
+
         # Communicate that this simulation has reset
         bs.net.send(b'RESET')
 
@@ -255,9 +288,22 @@ class Simulation(Base):
 
     def fastforward(self, nsec=None):
         ''' Run in fast-time (for nsec seconds if specified). '''
+        # BluePlan-obs (UG-05 / A5 G5, G6): emit FF_BEGIN with speedup info,
+        # add the missing logger.set_state mirror, and tag the state
+        # transition. FF_END is emitted by update() when ffstop is reached
+        # (it falls through to op() or hold(), which print their own STATE
+        # prefix). This branch tags the start; the end is the resulting state
+        # change in update().
+        prev = self.state
         self.state = bs.OP
         self.ffmode = True
         self.ffstop = (self.simt + nsec) if nsec else None
+        ff_stop_str = f'{self.ffstop:.3f}' if self.ffstop is not None else 'unbounded'
+        print(f'[STATE] {prev}->OP')
+        print(f'[FF_BEGIN] from_simt={self.simt:.3f} nsec={nsec} stop_simt={ff_stop_str} dtmult={self.dtmult}')
+        logger = get_logger()
+        if logger:
+            logger.set_state(logger.STATE_RUNNING)
 
     def benchmark(self, fname='IC', dt=300.0):
         ''' Run a simulation benchmark.

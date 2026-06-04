@@ -1,6 +1,7 @@
 """BlueSky ADS-B datafeed plugin. Reads the feed from a Mode-S Beast server,
 and visualizes traffic in BlueSky."""
 
+import threading
 import time
 
 from bluesky import settings, stack, traf
@@ -13,6 +14,53 @@ settings.set_variable_defaults(modeS_host="", modeS_port=0)
 
 # Global data
 reader = None
+
+# UG-19 / audit-2: Mode-S Beast checksum was defined but never called, so
+# bad-parity rejection was structurally unobservable. We now invoke
+# Decoder.checksum() in the read path and count failures, logging the
+# first 3 verbatim then sampling 1-in-N. Counter is module-level + lock-
+# protected because BlueSky's plugin loader may invoke processData from
+# the asyncio TCP callback.
+_beast_lock = threading.Lock()
+_beast_counters = {
+    "checksum_failures": 0,
+    "checksum_passes": 0,
+    "frames_too_short": 0,
+}
+
+
+def _bump_beast(name: str) -> int:
+    """Thread-safe increment of a Beast counter. Returns new value."""
+    with _beast_lock:
+        new = _beast_counters.get(name, 0) + 1
+        _beast_counters[name] = new
+        return new
+
+
+def beast_counter_snapshot() -> dict:
+    """Snapshot of Mode-S Beast counters for diagnostics."""
+    with _beast_lock:
+        return dict(_beast_counters)
+
+
+# BluePlan-obs B5 (Pattern P-F, UG-21/UG-25): per-plugin update-hook error
+# counter. The DATAFEED preupdate hook fires on every sim step; without this
+# guard a single bad TCP frame parse could trip an unhandled exception and
+# silently kill the per-tick callback for the remainder of the run.
+_update_errors_total = 0
+_update_errors_logged = 0
+
+
+def _b5_record_update_error(plugin, e):
+    global _update_errors_total, _update_errors_logged
+    _update_errors_total += 1
+    if _update_errors_logged < 3 or _update_errors_total % 1000 == 0:
+        _update_errors_logged += 1
+        print(
+            f'[PLUGIN_UPDATE_ERROR] plugin={plugin} '
+            f'reason={type(e).__name__}: {e}',
+            flush=True,
+        )
 
 
 ### Initialization function of the adsbfeed plugin.
@@ -127,7 +175,32 @@ class Modesbeast(TcpSocket):
         """
 
         if len(msg) < 28:
+            _bump_beast("frames_too_short")
             return
+
+        # UG-19: validate parity before trusting the frame. Decoder.checksum()
+        # was defined but never invoked, so bad-parity frames flowed
+        # straight into the position update path. Now we drop them and
+        # count them so operators can see bad-parity rates.
+        try:
+            ok = Decoder.checksum(msg)
+        except (ValueError, IndexError, TypeError):
+            ok = False
+        if not ok:
+            n = _bump_beast("checksum_failures")
+            if n <= 3:
+                # Truncate the hex so a runaway buffer can't flood logs.
+                print(
+                    "[ADSBFEED] WARNING: Mode-S checksum failure "
+                    "(#%d): msg=%s" % (n, msg[:64])
+                )
+            elif n % 1000 == 0:
+                print(
+                    "[ADSBFEED] WARNING: Mode-S checksum failures "
+                    "now total %d (sampled)" % n
+                )
+            return
+        _bump_beast("checksum_passes")
 
         df = Decoder.get_df(msg)
 
@@ -274,11 +347,18 @@ class Modesbeast(TcpSocket):
         return
 
     def update(self):
-        if self.isConnected():
-            # self.debug()
-            self.remove_outdated_ac()
-            self.update_all_ac_postition()
-            self.stack_all_commands()
+        # BluePlan-obs B5 (UG-21): guard the tick body so a single bad frame
+        # cannot kill the preupdate callback for the rest of the run.
+        try:
+            if self.isConnected():
+                # self.debug()
+                self.remove_outdated_ac()
+                self.update_all_ac_postition()
+                self.stack_all_commands()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            _b5_record_update_error(__name__, e)
 
     def toggle(self, flag=None):
         if flag is None:

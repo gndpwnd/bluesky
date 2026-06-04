@@ -1,4 +1,5 @@
 """ Node encapsulates the sim process, and manages process I/O. """
+import traceback
 from threading import Thread
 import zmq
 import msgpack
@@ -10,39 +11,63 @@ class IOThread(Thread):
     ''' Separate thread for node I/O. '''
     def run(self):
         ''' Implementation of the I/O loop. '''
-        ctx = zmq.Context.instance()
-        fe_event = ctx.socket(zmq.DEALER)
-        fe_stream = ctx.socket(zmq.PUB)
-        be_event = ctx.socket(zmq.PAIR)
-        be_stream = ctx.socket(zmq.PAIR)
-        fe_event.connect('tcp://localhost:10000')
-        fe_stream.connect('tcp://localhost:10001')
+        # BluePlan-obs (UG-10 / Audit 6 EP1): wrap the entire I/O loop in an
+        # outer try/except so an unhandled exception on the I/O thread
+        # produces a parseable [BLUESKY_FATAL] marker + traceback on stdout
+        # AND flips a `Node._iothread_failed` flag the main loop can check.
+        # Previously the thread died silently and the sim hung undetected.
+        try:
+            ctx = zmq.Context.instance()
+            fe_event = ctx.socket(zmq.DEALER)
+            fe_stream = ctx.socket(zmq.PUB)
+            be_event = ctx.socket(zmq.PAIR)
+            be_stream = ctx.socket(zmq.PAIR)
+            fe_event.connect('tcp://localhost:10000')
+            fe_stream.connect('tcp://localhost:10001')
 
-        be_event.connect('inproc://event')
-        be_stream.connect('inproc://stream')
-        poller = zmq.Poller()
-        poller.register(fe_event, zmq.POLLIN)
-        poller.register(be_event, zmq.POLLIN)
-        poller.register(be_stream, zmq.POLLIN)
+            be_event.connect('inproc://event')
+            be_stream.connect('inproc://stream')
+            poller = zmq.Poller()
+            poller.register(fe_event, zmq.POLLIN)
+            poller.register(be_event, zmq.POLLIN)
+            poller.register(be_stream, zmq.POLLIN)
 
-        while True:
+            while True:
+                try:
+                    poll_socks = dict(poller.poll(None))
+                except zmq.ZMQError:
+                    break  # interrupted
+
+                if poll_socks.get(fe_event) == zmq.POLLIN:
+                    be_event.send_multipart(fe_event.recv_multipart())
+                if poll_socks.get(be_event) == zmq.POLLIN:
+                    msg = be_event.recv_multipart()
+                    if msg[0] == b'QUIT':
+                        break
+                    fe_event.send_multipart(msg)
+                if poll_socks.get(be_stream) == zmq.POLLIN:
+                    fe_stream.send_multipart(be_stream.recv_multipart())
+        except Exception as exc:
+            # BluePlan-obs (UG-10 / Audit 6 EP1): structured marker so the
+            # runner's bus subscriber catches I/O-thread death. Also flip
+            # the class-level flag the main thread polls. Don't re-raise —
+            # this is a thread `run()`; an uncaught exception here is
+            # silently swallowed by Thread anyway, which is the bug we're
+            # fixing.
             try:
-                poll_socks = dict(poller.poll(None))
-            except zmq.ZMQError:
-                break  # interrupted
-
-            if poll_socks.get(fe_event) == zmq.POLLIN:
-                be_event.send_multipart(fe_event.recv_multipart())
-            if poll_socks.get(be_event) == zmq.POLLIN:
-                msg = be_event.recv_multipart()
-                if msg[0] == b'QUIT':
-                    break
-                fe_event.send_multipart(msg)
-            if poll_socks.get(be_stream) == zmq.POLLIN:
-                fe_stream.send_multipart(be_stream.recv_multipart())
+                print(f'[BLUESKY_FATAL] phase=iothread kind={type(exc).__name__} msg={exc}')
+                traceback.print_exc()
+            except Exception:
+                pass
+            Node._iothread_failed = True
 
 
 class Node:
+    # BluePlan-obs (UG-10 / Audit 6 EP1): class-level flag flipped by
+    # IOThread on a fatal exception. The main loop can poll this to detect
+    # silent I/O-thread death and shut down cleanly.
+    _iothread_failed = False
+
     def __init__(self):
         self.server_id = b''
         self.node_id = b''

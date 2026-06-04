@@ -1,6 +1,10 @@
 """ Implementation of BlueSky's plugin system. """
 import ast
 import importlib
+import json
+import os
+import tempfile
+import time
 from pathlib import Path
 import bluesky as bs
 from bluesky import plugins
@@ -10,6 +14,122 @@ from bluesky import stack
 
 # Register settings defaults
 settings.set_variable_defaults(plugin_path='plugins', enabled_plugins=['datafeed'])
+
+
+def _plugins_json_path():
+    """ BluePlan-obs (UG-20, B7a): resolve the canonical ``plugins.json``
+    location under the active BlueSky log path. The runner passes a per-run
+    output folder via ``--datadir`` / ``settings.log_path``; ``bs.resource``
+    folds the configured prefix into an absolute path. Returns ``None`` if
+    resource resolution is not yet wired (very early init, headless tests).
+    """
+    try:
+        log_dir = bs.resource(settings.log_path)
+    except Exception:
+        return None
+    if log_dir is None:
+        return None
+    try:
+        return Path(log_dir) / 'plugins.json'
+    except Exception:
+        return None
+
+
+def _write_plugins_json(name, status, reason):
+    """ BluePlan-obs (UG-20, B7a): atomic-rename writer for ``plugins.json``.
+
+    The bus subscriber (``app/bluesky_process.consume_plugins_json``) folds
+    this file into ``run_info["plugins"]`` on every watchdog tick. The wire
+    is best-effort: a missing/locked output folder MUST NOT block plugin
+    load — the stdout ``[PLUGIN_STATUS]`` line remains the durable signal.
+
+    Schema:
+        {
+          "plugins": {<name>: {"status": ..., "reason": ..., "ts": ...}},
+          "last_updated": <unix-ts>
+        }
+    """
+    path = _plugins_json_path()
+    if path is None:
+        return
+    try:
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    # Best-effort read of the existing file so we accumulate entries across
+    # plugin loads instead of overwriting on every emission.
+    data = {'plugins': {}, 'last_updated': 0.0}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+            if isinstance(existing, dict):
+                plugins_block = existing.get('plugins')
+                if isinstance(plugins_block, dict):
+                    data['plugins'] = plugins_block
+        except Exception:
+            # Malformed sidecar: fall through and rewrite cleanly.
+            pass
+    ts = time.time()
+    data['plugins'][name] = {
+        'status': status,
+        'reason': reason,
+        'ts': ts,
+    }
+    data['last_updated'] = ts
+    # Atomic write: temp file in the same directory, then os.replace.
+    tmp_fd = None
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix='.plugins.', suffix='.json.tmp', dir=str(path.parent))
+        with os.fdopen(tmp_fd, 'w') as f:
+            tmp_fd = None
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, str(path))
+        tmp_path = None
+    except Exception:
+        # Filesystem races / read-only mounts / disk full: swallow so plugin
+        # load never aborts on observability bookkeeping.
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except Exception:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def _emit_plugin_status(name, status, reason=''):
+    """ BluePlan-obs (Pattern P-E, UG-14): emit a structured per-plugin
+    status event. The prefix line is the durable signal — it survives even
+    when the ZMQ bus is not yet up (plugin loading runs early in init).
+    The bs.net.send PLUGINSTATUS path is best-effort and silently no-ops if
+    the network layer hasn't been initialised yet.
+    """
+    try:
+        print(f'[PLUGIN_STATUS] name={name} status={status} reason={reason}')
+    except Exception:
+        # stdout being None or closed should never block plugin load.
+        pass
+    try:
+        if getattr(bs, 'net', None) is not None:
+            bs.net.send('PLUGINSTATUS', dict(name=name, status=status, reason=reason))
+    except Exception:
+        # Network not up yet, or transient send failure — the stdout prefix
+        # is the source of truth; the bus emission is opportunistic.
+        pass
+    # BluePlan-obs (UG-20, B7a): also mirror the status into plugins.json
+    # under the active log path so consume_plugins_json can fold the record
+    # into run_info on the next watchdog tick. Wrapped in its own try so a
+    # filesystem fault never breaks the load pipeline.
+    try:
+        _write_plugins_json(name, status, reason)
+    except Exception:
+        pass
 
 
 class Plugin:
@@ -33,6 +153,13 @@ class Plugin:
         self.plugin_type  = ''
         self.plugin_stack = []
         self.loaded = False
+        # BluePlan-obs (Pattern P-E, UG-14/UG-20): track partial-load state.
+        # `status` is one of: 'unloaded', 'loaded_full', 'loaded_partial',
+        # 'failed'. `status_reason` carries the warning text for the partial
+        # / failed cases so the bus subscriber can persist it into
+        # plugins.json without re-grepping stdout.
+        self.status = 'unloaded'
+        self.status_reason = ''
         self.imp = None
 
     def _load(self):
@@ -53,8 +180,13 @@ class Plugin:
 
             # CRIT-006: Health check 1 — init_plugin must exist and be callable
             if not hasattr(self.imp, 'init_plugin'):
+                # BluePlan-obs (Pattern P-E, UG-14): mirror status.
+                reason = 'missing init_plugin() entry point'
+                self.status = 'failed'
+                self.status_reason = reason
+                _emit_plugin_status(self.plugin_name, 'failed', reason)
                 return False, (
-                    f'Plugin {self.plugin_name} missing init_plugin() entry point'
+                    f'Plugin {self.plugin_name} {reason}'
                 )
 
             # Initialize the plugin
@@ -62,20 +194,35 @@ class Plugin:
                 result = self.imp.init_plugin()
             except Exception as init_exc:
                 # CRIT-006: Graceful degradation on init failure
+                # BluePlan-obs (Pattern P-E, UG-14): mirror status.
+                reason = f'init_plugin() failed: {init_exc}'
+                self.status = 'failed'
+                self.status_reason = reason
+                _emit_plugin_status(self.plugin_name, 'failed', reason)
                 return False, (
-                    f'Plugin {self.plugin_name} init_plugin() failed: {init_exc}'
+                    f'Plugin {self.plugin_name} {reason}'
                 )
 
             config = result if isinstance(result, dict) else result[0]
 
             # CRIT-006: Health check 2 — config must have required fields
             if not isinstance(config, dict):
+                # BluePlan-obs (Pattern P-E, UG-14): mirror status.
+                reason = 'returned invalid config (not dict)'
+                self.status = 'failed'
+                self.status_reason = reason
+                _emit_plugin_status(self.plugin_name, 'failed', reason)
                 return False, (
-                    f'Plugin {self.plugin_name} returned invalid config (not dict)'
+                    f'Plugin {self.plugin_name} {reason}'
                 )
             if 'plugin_name' not in config or 'plugin_type' not in config:
+                # BluePlan-obs (Pattern P-E, UG-14): mirror status.
+                reason = 'config missing plugin_name/plugin_type'
+                self.status = 'failed'
+                self.status_reason = reason
+                _emit_plugin_status(self.plugin_name, 'failed', reason)
                 return False, (
-                    f'Plugin {self.plugin_name} config missing plugin_name/plugin_type'
+                    f'Plugin {self.plugin_name} {reason}'
                 )
 
             if self.plugin_type == 'sim':
@@ -92,8 +239,15 @@ class Plugin:
                     ve.register_data_parent(self.imp, self.plugin_name.lower())
                 except Exception as sim_exc:
                     # CRIT-006: Log but continue — don't fail whole plugin on
-                    # optional sim-specific setup failures
-                    print(f'Warning: plugin {self.plugin_name} sim setup failed: {sim_exc}')
+                    # optional sim-specific setup failures.
+                    # BluePlan-obs (Pattern P-E, UG-14): record partial-load
+                    # status and emit a structured event so the runner can
+                    # see "loaded but half-broken" plugins.
+                    reason = f'sim setup failed: {sim_exc}'
+                    self.status = 'loaded_partial'
+                    self.status_reason = reason
+                    print(f'Warning: plugin {self.plugin_name} {reason}')
+                    _emit_plugin_status(self.plugin_name, 'loaded_partial', reason)
 
             if isinstance(result, (tuple, list)) and len(result) > 1:
                 try:
@@ -101,19 +255,41 @@ class Plugin:
                     # Add the plugin's stack functions to the stack
                     bs.stack.append_commands(stackfuns)
                 except Exception as stack_exc:
-                    # CRIT-006: Stack registration failures don't block the plugin
-                    print(f'Warning: plugin {self.plugin_name} stack registration failed: {stack_exc}')
+                    # CRIT-006: Stack registration failures don't block the plugin.
+                    # BluePlan-obs (Pattern P-E, UG-14): mark partial and emit.
+                    reason = f'stack registration failed: {stack_exc}'
+                    self.status = 'loaded_partial'
+                    self.status_reason = reason
+                    print(f'Warning: plugin {self.plugin_name} {reason}')
+                    _emit_plugin_status(self.plugin_name, 'loaded_partial', reason)
 
             self.loaded = True
+            # BluePlan-obs (Pattern P-E): only promote to 'loaded_full' when
+            # no partial-status branch fired above. Either way, emit a status
+            # line so the runner gets the success/partial confirmation
+            # without having to grep the "Successfully loaded plugin X" line.
+            if self.status != 'loaded_partial':
+                self.status = 'loaded_full'
+            _emit_plugin_status(self.plugin_name, self.status, self.status_reason)
             return True, 'Successfully loaded plugin %s' % self.plugin_name
 
         except ImportError as e:
             # CRIT-006: Fallback mechanism — missing plugin is not fatal
+            # BluePlan-obs (Pattern P-E, UG-14): emit failure event.
+            reason = f'not available: {e}'
+            self.status = 'failed'
+            self.status_reason = reason
             print('BlueSky plugin system: plugin', self.plugin_name, 'not available:', e)
+            _emit_plugin_status(self.plugin_name, 'failed', reason)
             return False, f'Plugin {self.plugin_name} not found (fallback to no-op)'
         except Exception as e:
             # CRIT-006: Catch-all for unexpected errors
+            # BluePlan-obs (Pattern P-E, UG-14): emit failure event.
+            reason = f'load failed: {e}'
+            self.status = 'failed'
+            self.status_reason = reason
             print('BlueSky plugin system: plugin', self.plugin_name, 'failed:', e)
+            _emit_plugin_status(self.plugin_name, 'failed', reason)
             return False, f'Plugin {self.plugin_name} load failed: {e}'
 
     @classmethod

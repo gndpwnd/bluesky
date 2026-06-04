@@ -1,4 +1,5 @@
 import sys
+import traceback
 import bluesky as bs
 from bluesky import cmdargs
 
@@ -63,10 +64,28 @@ def main():
     except ImportError as error:
         modulename = missingmodules.get(error.name) or error.name
         if modulename is None or 'bluesky' in modulename:
+            # BluePlan-obs (Audit 6 EP3): emit a structured startup_failed
+            # marker even when this branch re-raises, so the runner sees the
+            # import failure before the process exits.
+            print(f'[BLUESKY_FATAL] phase=startup kind=ImportError module={modulename} msg={error}')
+            traceback.print_exc()
             raise error
         print("Bluesky needs", modulename)
         print("Run setup-python.bat (Windows) or check requirements.txt (other systems)")
         print("Install using e.g. pip install", modulename)
+
+    # BluePlan-obs (Audit 6 EP3): broaden the net for non-import startup
+    # failures. The point is observability — log a structured marker, then
+    # re-raise so the process exits with a non-zero status (NOT silent
+    # swallow). Previously these blew up with no parseable signature.
+    except Exception as startup_exc:
+        try:
+            print(f'[BLUESKY_FATAL] phase=startup kind={type(startup_exc).__name__} msg={startup_exc}')
+            traceback.print_exc()
+        except Exception:
+            # Defensive: even structured logging can fail if stdout is gone.
+            pass
+        raise
 
     finally:
         # Shut down logging manager

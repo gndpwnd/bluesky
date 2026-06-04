@@ -8,6 +8,25 @@ from bluesky.tools import datalog, areafilter
 from bluesky.core import Entity, timed_function
 from bluesky.tools.aero import ft,kts,nm,fpm
 
+
+# BluePlan-obs B5 (Pattern P-F, UG-21/UG-25): per-plugin update-hook error
+# counter; see conflictcam.py for the rationale and the `[PLUGIN_UPDATE_ERROR]`
+# stdout contract.
+_update_errors_total = 0
+_update_errors_logged = 0
+
+
+def _b5_record_update_error(plugin, e):
+    global _update_errors_total, _update_errors_logged
+    _update_errors_total += 1
+    if _update_errors_logged < 3 or _update_errors_total % 1000 == 0:
+        _update_errors_logged += 1
+        print(
+            f'[PLUGIN_UPDATE_ERROR] plugin={plugin} '
+            f'reason={type(e).__name__}: {e}',
+            flush=True,
+        )
+
 # Log parameters for the flight statistics log
 flstheader = \
     '#######################################################\n' + \
@@ -141,6 +160,16 @@ class Area(Entity):
     def update(self, dt):
         ''' Update flight efficiency metrics
             2D and 3D distance [m], and work done (force*distance) [J] '''
+        # BluePlan-obs B5 (UG-21): guard the tick body so a single bad frame
+        # cannot kill the timed-function callback for the rest of the run.
+        try:
+            self._b5_update_body(dt)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            _b5_record_update_error(__name__, e)
+
+    def _b5_update_body(self, dt):
         if self.active:
             resultantspd = np.sqrt(traf.gs * traf.gs + traf.vs * traf.vs)
             self.distance2D += dt * traf.gs
