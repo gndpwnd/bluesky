@@ -189,7 +189,13 @@ class ND(QGLWidget):
             self.text_shader.bind_uniform_buffer('global_data', self.globaldata)
 
         except RuntimeError as e:
-            qCritical('Error compiling shaders in radarwidget: ' + e.args[0])
+            # BluePlan: stdout fallback for headless/runner observability
+            # (qCritical writes via Qt's message handler which is not always
+            # captured by the BluePlan subprocess pipes). Paired with
+            # markers.yaml id `shader_compile_error` (category: gui_crash).
+            _err = e.args[0] if e.args else str(e)
+            print('[OPENGL_FATAL] kind=shader_compile_error widget=radarwidget msg=' + str(_err), flush=True)
+            qCritical('Error compiling shaders in radarwidget: ' + _err)
             return
 
         # Set initial zoom

@@ -708,6 +708,11 @@ class RenderWidget(QOpenGLWidget, RenderTarget):
         gl_version = float(gl.glGetString(gl.GL_VERSION)[:3])
         if gl_version < 3.3:
             print(('OpenGL context created with GL version %.1f' % gl_version))
+            # BluePlan: stdout fallback for headless/runner observability
+            # (qCritical writes to Qt's message handler which may be invisible
+            # to the BlueSky-subprocess capture). Paired with markers.yaml id
+            # `opengl_minimum_unmet` (category: gui_crash).
+            print('[OPENGL_FATAL] kind=minimum_unmet reported_version=%.1f required=3.3' % gl_version, flush=True)
             qCritical("""Your system reports that it supports OpenGL up to version %.1f. The minimum requirement for BlueSky is OpenGL 3.3.
                 Generally, AMD/ATI/nVidia cards from 2008 and newer support OpenGL 3.3, and Intel integrated graphics from the Haswell
                 generation and newer. If you think your graphics system should be able to support GL>=3.3 please open an issue report
@@ -715,6 +720,9 @@ class RenderWidget(QOpenGLWidget, RenderTarget):
             return
 
         if self._shaderset is None and self._renderobjs:
+            # BluePlan: stdout fallback paired with markers.yaml id
+            # `opengl_shaderset_missing` (category: gui_crash).
+            print('[OPENGL_FATAL] kind=shaderset_missing msg=Cannot create render objects without an initialised shader set', flush=True)
             qCritical("Cannot create render objects without an initialised shader set!")
             return
 

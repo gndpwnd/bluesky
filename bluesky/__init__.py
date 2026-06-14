@@ -71,7 +71,13 @@ def init(mode='sim', configfile=None, scenfile=None, discoverable=False,
     import os
     debug_enabled = debug or os.getenv('BLUESKY_DEBUG', '0') == '1'
     from bluesky.logging_manager import init_logging
-    init_logging(debug=debug_enabled)
+    # BLUEPLAN_LOG_DIR lets the BluePlan runner redirect bluesky_session_<pid>.log
+    # into the per-run output folder (UG-27); when unset, fall back to /tmp.
+    blueplan_log_dir = os.environ.get('BLUEPLAN_LOG_DIR')
+    if blueplan_log_dir:
+        init_logging(debug=debug_enabled, log_dir=blueplan_log_dir)
+    else:
+        init_logging(debug=debug_enabled)
 
     # Initialise resource localisation, and set custom working directory if present
     from bluesky import pathfinder

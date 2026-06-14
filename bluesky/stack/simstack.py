@@ -130,7 +130,16 @@ def process(ext_cmds=None):
             # the original scenario-side echo formatting.
             if not Stack.sender_id:
                 echotext = f'{cmdline}\n{echotext}'
-            print(f'[CMD_REJECTED] flags={echoflags} cmd={cmdu} line={cmdline}')
+            # BluePlan-obs (B-GC-followon leftover 1, 2026-06-04): append a
+            # `text=...` field carrying repr() of the human echotext so the
+            # BluePlan runner aggregator (_parse_cmd_rejected_snippet at
+            # ../../app/bluesky/runner.py) can populate
+            # first_failure.echotext_hint deterministically instead of
+            # heuristically pairing against echo_log. The marker stays a
+            # single line — repr() handles embedded newlines/quotes. The
+            # field is appended (not restructured) so legacy parsers and
+            # the cmd_rejected_with_text regex in markers.yaml still match.
+            print(f'[CMD_REJECTED] flags={echoflags} cmd={cmdu} line={cmdline} text={echotext!r}')
 
         # Always return on command
         if echotext:
